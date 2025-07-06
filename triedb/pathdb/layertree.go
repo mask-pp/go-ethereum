@@ -31,8 +31,9 @@ import (
 // thread-safe to use. However, callers need to ensure the thread-safety
 // of the referenced layer by themselves.
 type layerTree struct {
-	base   *diskLayer
-	layers map[common.Hash]layer
+	base       *diskLayer
+	leveLayers map[uint64][]layer
+	layers     map[common.Hash]layer
 
 	// descendants is a two-dimensional map where the keys represent
 	// an ancestor state root, and the values are the state roots of
@@ -61,10 +62,12 @@ func (tree *layerTree) init(head layer) {
 
 	current := head
 	tree.layers = make(map[common.Hash]layer)
+	tree.leveLayers = make(map[uint64][]layer)
 	tree.descendants = make(map[common.Hash]map[common.Hash]struct{})
 
 	for {
 		tree.layers[current.rootHash()] = current
+		tree.leveLayers[current.stateID()] = append(tree.leveLayers[current.stateID()], current)
 		tree.fillAncestors(current)
 
 		parent := current.parentLayer()
@@ -163,6 +166,7 @@ func (tree *layerTree) add(root common.Hash, parentRoot common.Hash, block uint6
 
 	// Link the given layer into the layer set
 	tree.layers[l.rootHash()] = l
+	tree.leveLayers[l.stateID()] = append(tree.leveLayers[l.stateID()], l)
 
 	// Link the given layer into its ancestors (up to the current disk layer)
 	tree.fillAncestors(l)
@@ -199,6 +203,9 @@ func (tree *layerTree) cap(root common.Hash, layers int) error {
 		tree.layers = map[common.Hash]layer{
 			base.rootHash(): base,
 		}
+		tree.leveLayers = map[uint64][]layer{
+			base.stateID(): {base},
+		}
 		// Resets the descendants map, since there's only a single disk layer
 		// with no descendants.
 		tree.descendants = make(map[common.Hash]map[common.Hash]struct{})
@@ -206,93 +213,50 @@ func (tree *layerTree) cap(root common.Hash, layers int) error {
 		return nil
 	}
 	// Dive until we run out of layers or reach the persistent database
-	for i := 0; i < layers-1; i++ {
-		// If we still have diff layers below, continue down
-		if parent, ok := diff.parentLayer().(*diffLayer); ok {
-			diff = parent
-		} else {
-			// Diff stack too shallow, return without modifications
-			return nil
-		}
+	parentID := diff.stateID() - uint64(layers)
+	if parentID <= tree.base.stateID() || parentID > diff.stateID() { // If the target parentID is below the base layer then do nothing.
+		return nil
 	}
 	// We're out of layers, flatten anything below, stopping if it's the disk or if
 	// the memory limit is not yet exceeded.
 	var (
-		err      error
-		replaced layer
-		newBase  *diskLayer
+		err     error
+		parent  *diffLayer
+		newBase *diskLayer
 	)
-	switch parent := diff.parentLayer().(type) {
-	case *diskLayer:
-		return nil
-
-	case *diffLayer:
-		// Hold the lock to prevent any read operations until the new
-		// parent is linked correctly.
-		diff.lock.Lock()
-
-		// Hold the reference of the original layer being replaced
-		replaced = parent
-
-		// Replace the original parent layer with new disk layer. The procedure
-		// can be illustrated as below:
-		//
-		// Before change:
-		//     Chain:
-		//        C1->C2->C3->C4 (HEAD)
-		//          ->C2'->C3'->C4'
-		//
-		// After change:
-		//     Chain:
-		//        (a) C3->C4 (HEAD)
-		//		  (b) C1->C2
-		//		        ->C2'->C3'->C4'
-		// The original C3 is replaced by the new base (with root C3)
-		// Dangling layers in (b) will be removed later
-		newBase, err = parent.persist(false)
-		if err != nil {
-			diff.lock.Unlock()
-			return err
+	for _, layer := range tree.leveLayers[parentID] {
+		if tree.isDescendant(diff.rootHash(), layer.rootHash()) {
+			parent = layer.(*diffLayer)
+			break
 		}
-		tree.layers[newBase.rootHash()] = newBase
+	}
+	if parent == nil {
+		return fmt.Errorf("triedb layer [%#x] is not a descendant of [%#x]", diff.rootHash(), root)
+	}
 
-		// Link the new parent and release the lock
+	newBase, err = parent.persist(false)
+	if err != nil {
+		return err
+	}
+	for id := tree.base.stateID(); id <= newBase.stateID(); id++ {
+		for _, layer := range tree.leveLayers[id] {
+			if layer.stateID() != tree.base.stateID() {
+				tree.lookup.removeLayer(layer.(*diffLayer))
+			}
+			// Unlink the layer from the layer tree and cascade to its children
+			delete(tree.descendants, layer.rootHash())
+			delete(tree.layers, layer.rootHash())
+		}
+		delete(tree.leveLayers, id)
+	}
+	for _, layer := range tree.leveLayers[newBase.stateID()+1] {
+		diff := layer.(*diffLayer)
+		diff.lock.Lock()
 		diff.parent = newBase
 		diff.lock.Unlock()
-
-	default:
-		panic(fmt.Sprintf("unknown data layer in triedb: %T", parent))
 	}
-	// Remove any layer that is stale or links into a stale layer
-	children := make(map[common.Hash][]common.Hash)
-	for root, layer := range tree.layers {
-		if dl, ok := layer.(*diffLayer); ok {
-			parent := dl.parentLayer().rootHash()
-			children[parent] = append(children[parent], root)
-		}
-	}
-	clearDiff := func(layer layer) {
-		diff, ok := layer.(*diffLayer)
-		if !ok {
-			return
-		}
-		tree.lookup.removeLayer(diff)
-	}
-	var remove func(root common.Hash)
-	remove = func(root common.Hash) {
-		clearDiff(tree.layers[root])
-
-		// Unlink the layer from the layer tree and cascade to its children
-		delete(tree.descendants, root)
-		delete(tree.layers, root)
-		for _, child := range children[root] {
-			remove(child)
-		}
-		delete(children, root)
-	}
-	remove(tree.base.rootHash()) // remove the old/stale disk layer
-	clearDiff(replaced)          // remove the lookup data of the stale parent being replaced
-	tree.base = newBase          // update the base layer with newly constructed one
+	tree.leveLayers[newBase.stateID()] = []layer{newBase}
+	tree.base = newBase // update the base layer with newly constructed one
 	return nil
 }
 
