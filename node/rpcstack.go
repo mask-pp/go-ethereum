@@ -155,6 +155,13 @@ func (h *httpServer) start() error {
 		h.disableWS()
 		return err
 	}
+
+	// Don't allow the server to listen on a different address than configured.
+	if listener.Addr().String() != h.endpoint {
+		listener.Close()
+		return fmt.Errorf("listening on %s failed, got %s", h.endpoint, listener.Addr().String())
+	}
+
 	h.listener = listener
 	go h.server.Serve(listener)
 
