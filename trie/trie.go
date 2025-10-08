@@ -694,24 +694,6 @@ func (t *Trie) resolveAndTrack(n hashNode, prefix []byte) (node, error) {
 	return decodeNodeUnsafe(n, blob)
 }
 
-// deletedNodes returns a list of node paths, referring the nodes being deleted
-// from the trie. It's possible a few deleted nodes were embedded in their parent
-// before, the deletions can be no effect by deleting nothing, filter them out.
-func (t *Trie) deletedNodes() [][]byte {
-	var (
-		pos   int
-		list  = t.opTracer.deletedList()
-		flags = t.prevalueTracer.HasList(list)
-	)
-	for i := 0; i < len(list); i++ {
-		if flags[i] {
-			list[pos] = list[i]
-			pos++
-		}
-	}
-	return list[:pos] // trim to the new length
-}
-
 // Hash returns the root hash of the trie. It does not write to the
 // database and can be used even if the trie doesn't have one.
 func (t *Trie) Hash() common.Hash {
@@ -733,13 +715,20 @@ func (t *Trie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	// (b) The trie was non-empty and all nodes are dropped => return
 	//     the node set includes all deleted nodes
 	if t.root == nil {
-		paths := t.deletedNodes()
-		if len(paths) == 0 {
-			return types.EmptyRootHash, nil // case (a)
-		}
-		nodes := trienode.NewNodeSet(t.owner)
+		var (
+			paths    = t.opTracer.deletedList()
+			nodes    = trienode.NewNodeSet(t.owner)
+			notEmpty = false
+		)
 		for _, path := range paths {
-			nodes.AddNode(path, trienode.NewDeletedWithPrev(t.prevalueTracer.Get(path)))
+			val := t.prevalueTracer.Get(path)
+			if val != nil {
+				nodes.AddNode(path, trienode.NewDeletedWithPrev(val))
+				notEmpty = true
+			}
+		}
+		if !notEmpty {
+			return types.EmptyRootHash, nil // case (a)
 		}
 		return types.EmptyRootHash, nodes // case (b)
 	}
@@ -756,8 +745,11 @@ func (t *Trie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 		return rootHash, nil
 	}
 	nodes := trienode.NewNodeSet(t.owner)
-	for _, path := range t.deletedNodes() {
-		nodes.AddNode(path, trienode.NewDeletedWithPrev(t.prevalueTracer.Get(path)))
+	for _, path := range t.opTracer.deletedList() {
+		val := t.prevalueTracer.Get(path)
+		if val != nil {
+			nodes.AddNode(path, trienode.NewDeletedWithPrev(val))
+		}
 	}
 	// If the number of changes is below 100, we let one thread handle it
 	t.root = newCommitter(nodes, t.prevalueTracer, collectLeaf).Commit(t.root, t.uncommitted > 100)
