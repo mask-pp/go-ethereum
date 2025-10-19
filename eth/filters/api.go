@@ -574,6 +574,8 @@ func (api *FilterAPI) GetFilterChanges(id rpc.ID) (interface{}, error) {
 			logs := f.logs
 			f.logs = nil
 			return returnLogs(logs), nil
+		default:
+			return nil, fmt.Errorf("unsupported filter type: %v", f.typ)
 		}
 	}
 
